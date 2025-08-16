@@ -1,38 +1,26 @@
 # -*- coding: utf-8 -*-
-"""
-BacktestEngine：把策略 on_bar 的 Signal 轉成部位、交易、損益與績效統計。
-假設：
-- 訊號 side ∈ {"BUY","SELL"}，表示目標方向（多/空，一次全量反手或進場）
-- 以當根 bar 的收盤價成交（實務可加入滑價 / 手續費）
-- 每個 symbol 獨立管理部位；qty 來自 Signal.qty
-- 期貨乘數（每跳點價值）從 config.MULTIPLIER 取得
-"""
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Iterable
+from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
-from strategy.core.events import Bar, Signal
-from strategy.config import STRATEGY_PARAMS
+from strategy.core.events import Bar, Tick, Signal
+from strategy.config import MULTIPLIER, TIMEZONE
+from strategy.core.calendar import is_third_wed_1329
+import pytz
 
-# 期貨乘數（可移到 config.py）
-MULTIPLIER: Dict[str, int] = {
-    "TXF": 200,   # 台指期
-    "MXF": 50,    # 小台指期
-}
-
-SLIPPAGE = 0.0   # 每口滑價（點）
-FEE_PER_CONTRACT = 0.0  # 單口手續費（以貨幣計）
+SLIPPAGE = 0.0
+FEE_PER_CONTRACT = 0.0
 
 @dataclass
 class Position:
-    side: int = 0          # 1=多, -1=空, 0=空手
+    side: int = 0
     qty: int = 0
     avg_price: float = 0.0
 
 @dataclass
 class Trade:
     symbol: str
-    side: str              # "LONG"/"SHORT"
+    side: str
     qty: int
     entry_ts: pd.Timestamp
     entry_price: float
@@ -49,113 +37,92 @@ class BacktestEngine:
         self.last_close: Dict[str, float] = {}
         self.trades: List[Trade] = []
         self.equity_records: List[Dict] = []
+        self.open_trade_idx: Dict[str, int] = {}
+        self.tz = pytz.timezone(TIMEZONE)
 
     def _mult(self, symbol: str) -> float:
-        # 依商品前綴選乘數
         for k, v in MULTIPLIER.items():
             if symbol.startswith(k):
                 return float(v)
         return 1.0
 
-    def on_bar(self, bar: Bar, signal: Optional[Signal]) -> None:
-        """處理一根 bar：先計算持有部位的浮損益，再依訊號調整部位並記錄交易。"""
-        sym = bar.symbol
+    def _close_trade(self, sym: str, ts: pd.Timestamp, price: float):
+        if sym not in self.open_trade_idx:
+            return
+        idx = self.open_trade_idx.pop(sym)
+        tr = self.trades[idx]
         mult = self._mult(sym)
+        sign = 1 if tr.side == "LONG" else -1
+        pnl = (price - tr.entry_price) * sign * tr.qty * mult
+        pnl -= FEE_PER_CONTRACT * tr.qty
+        tr.exit_ts = ts
+        tr.exit_price = price
+        tr.pnl = pnl
+        self.equity += pnl
+        self.positions[sym] = Position()
 
-        # --- 浮損益（上一根收盤到本根收盤）
+    def on_tick(self, tick: Tick, signal_from_strategy: Optional[Signal] = None):
+        sym = tick.symbol
+        mult = self._mult(sym)
         prev_close = self.last_close.get(sym)
         if prev_close is not None:
             pos = self.positions.get(sym, Position())
-            dprice = (bar.c - prev_close)
+            dprice = (tick.price - prev_close)
             self.equity += pos.side * pos.qty * dprice * mult
-        self.last_close[sym] = bar.c  # 更新 close
+        self.last_close[sym] = tick.price
 
-        # --- 有訊號就調整目標部位（反手/進出場）
-        if signal:
-            target_side = 1 if signal.side.upper() == "BUY" else -1
-            qty = int(signal.qty or STRATEGY_PARAMS.get("qty", 1))
-            fill_price = bar.c + (SLIPPAGE * target_side)
-            fee = FEE_PER_CONTRACT * qty
+        # 自動平倉（每月第三個週三 13:29）
+        if is_third_wed_1329(tick.ts.to_pydatetime() if hasattr(tick.ts, 'to_pydatetime') else tick.ts):
+            pos = self.positions.get(sym, Position())
+            if pos.side != 0:
+                self._close_trade(sym, tick.ts, tick.price)
 
+        sig = signal_from_strategy
+        if sig:
+            target_side = 1 if sig.side.upper() == "BUY" else -1 if sig.side.upper() == "SELL" else 0
+            qty = int(sig.qty or 1)
+            fill_price = tick.price + (SLIPPAGE * (1 if target_side>0 else -1 if target_side<0 else 0))
             cur = self.positions.get(sym, Position())
-            # 目標與現況不同 → 先平倉再反手
-            if cur.side != 0 and cur.side != target_side:
-                # 平掉舊部位
-                pnl = (fill_price - cur.avg_price) * (cur.side) * cur.qty * self._mult(sym) * -1
-                pnl -= FEE_PER_CONTRACT * cur.qty
-                self.equity += pnl
-                self.trades[-1].exit_ts = bar.ts
-                self.trades[-1].exit_price = fill_price
-                self.trades[-1].pnl = pnl
-                # 清空
-                cur = Position()
-
-            # 進新倉/加碼成目標（簡化為整體設定成 target）
-            if target_side != 0:
-                # 開立新交易紀錄（先暫存，出場時補 exit 與 pnl）
-                self.trades.append(Trade(
-                    symbol=sym,
-                    side="LONG" if target_side == 1 else "SHORT",
-                    qty=qty,
-                    entry_ts=bar.ts,
-                    entry_price=fill_price,
-                    exit_ts=pd.NaT, exit_price=np.nan,
-                    pnl=0.0, bars_held=0
-                ))
-                self.equity -= fee
-                self.positions[sym] = Position(side=target_side, qty=qty, avg_price=fill_price)
-            else:
-                # 目標空手 → 若目前有倉，平倉
+            if cur.side != 0 and target_side != 0 and cur.side != target_side:
+                self._close_trade(sym, tick.ts, fill_price)
+            if target_side == 0:
                 if cur.side != 0:
-                    pnl = (fill_price - cur.avg_price) * (cur.side) * cur.qty * self._mult(sym) * -1
-                    pnl -= FEE_PER_CONTRACT * cur.qty
-                    self.equity += pnl
-                    self.trades[-1].exit_ts = bar.ts
-                    self.trades[-1].exit_price = fill_price
-                    self.trades[-1].pnl = pnl
-                    self.positions[sym] = Position()
+                    self._close_trade(sym, tick.ts, fill_price)
+                return
+            if sym in self.open_trade_idx:
+                self._close_trade(sym, tick.ts, fill_price)
+            side_str = "LONG" if target_side == 1 else "SHORT"
+            self.trades.append(Trade(sym, side_str, qty, tick.ts, fill_price, pd.NaT, np.nan, 0.0, 0))
+            self.open_trade_idx[sym] = len(self.trades)-1
+            self.positions[sym] = Position(side=target_side, qty=qty, avg_price=fill_price)
 
-        # --- 記錄 equity（用於後續統計）
-        self.equity_records.append({"ts": bar.ts, "equity": self.equity})
+        self.equity_records.append({"ts": tick.ts, "equity": self.equity})
+
+    def on_bar_signal(self, bar: Bar, signal_from_strategy: Optional[Signal] = None):
+        if not signal_from_strategy:
+            return
+        tick_like = Tick(bar.symbol, bar.ts, bar.c, bar.v)
+        self.on_tick(tick_like, signal_from_strategy)
 
     def close_all(self, ts: pd.Timestamp):
-        """回測結束時以最後價格結算所有部位。"""
-        for sym, pos in list(self.positions.items()):
-            if pos.side == 0:
-                continue
-            last_c = self.last_close.get(sym)
-            if last_c is None:
-                continue
-            mult = self._mult(sym)
-            pnl = (last_c - pos.avg_price) * (pos.side) * pos.qty * mult * -1
-            pnl -= FEE_PER_CONTRACT * pos.qty
-            self.equity += pnl
-            self.trades[-1].exit_ts = ts
-            self.trades[-1].exit_price = last_c
-            self.trades[-1].pnl = pnl
-            self.positions[sym] = Position()
+        for sym in list(self.open_trade_idx.keys()):
+            last_price = self.last_close.get(sym)
+            if last_price is None: continue
+            self._close_trade(sym, ts, last_price)
 
-    # ---------------- 統計輸出 ----------------
     def results(self) -> Dict:
         eq = pd.DataFrame(self.equity_records).drop_duplicates("ts").set_index("ts").sort_index()
         eq["ret"] = eq["equity"].pct_change().fillna(0.0)
-
-        # 以日頻統計 Sharpe / 年化
         daily = eq["equity"].resample("1D").last().dropna()
         daily_ret = daily.pct_change().dropna()
-        sharpe = (daily_ret.mean() / (daily_ret.std() + 1e-12)) * np.sqrt(252) if len(daily_ret) > 0 else 0.0
-
-        # 最大回撤
-        roll_max = eq["equity"].cummax()
-        dd = eq["equity"] / roll_max - 1.0
+        sharpe = (daily_ret.mean() / (daily_ret.std() + 1e-12)) * np.sqrt(252) if len(daily_ret) else 0.0
+        roll_max = eq["equity"].cummax() if len(eq) else pd.Series(dtype=float)
+        dd = eq["equity"] / roll_max - 1.0 if len(eq) else pd.Series(dtype=float)
         max_dd = dd.min() if len(dd) else 0.0
-
-        # 交易統計
         trades_df = pd.DataFrame([t.__dict__ for t in self.trades])
         win_rate = float((trades_df["pnl"] > 0).mean()) if len(trades_df) else 0.0
         avg_pnl = float(trades_df["pnl"].mean()) if len(trades_df) else 0.0
         total_pnl = float(trades_df["pnl"].sum()) if len(trades_df) else 0.0
-
         return {
             "start_cash": self.start_cash,
             "end_equity": float(eq["equity"].iloc[-1]) if len(eq) else self.start_cash,
